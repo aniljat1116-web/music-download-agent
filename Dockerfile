@@ -1,4 +1,25 @@
-# Production Dockerfile for Independent Music Download Agent
+# ==========================================
+# Stage 1: Build React Client Frontend
+# ==========================================
+FROM node:20-bookworm-slim AS client-builder
+
+WORKDIR /app/client
+
+# Copy client dependency definitions
+COPY client/package*.json ./
+
+# Install all client dependencies including devDependencies (Vite, Rollup, Babel)
+RUN npm ci
+
+# Copy client source files and configuration
+COPY client/ ./
+
+# Build production bundle into /app/client/dist
+RUN npm run build
+
+# ==========================================
+# Stage 2: Production Runtime Image
+# ==========================================
 FROM node:20-bookworm-slim
 
 # Install Chromium and system dependencies required for Puppeteer
@@ -15,7 +36,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Environment variables for Chromium & Node
+# Environment variables for Chromium & Node production runtime
 ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true \
     PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium \
     NODE_ENV=production \
@@ -24,21 +45,17 @@ ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true \
 
 WORKDIR /app
 
-# Copy root and client package definitions
+# Copy root server dependency definitions
 COPY package*.json ./
-COPY client/package*.json ./client/
 
-# Install dependencies for server and client
-RUN npm ci --omit=dev && \
-    npm --prefix client ci
+# Install only production server dependencies
+RUN npm ci --omit=dev
 
-# Copy application source code
+# Copy backend server code
 COPY server ./server
-COPY client ./client
 
-# Build client React application
-RUN npm --prefix client run build && \
-    rm -rf client/node_modules
+# Copy compiled frontend assets from Stage 1 (no client devDependencies in final image)
+COPY --from=client-builder /app/client/dist ./client/dist
 
 # Ensure downloads directory exists with correct permissions
 RUN mkdir -p /app/downloads && chown -R node:node /app
