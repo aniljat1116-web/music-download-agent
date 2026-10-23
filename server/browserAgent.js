@@ -2,21 +2,72 @@ const puppeteer = require('puppeteer-core');
 const path = require('path');
 const fs = require('fs');
 const { execFileSync } = require('child_process');
+const { pipeline } = require('stream/promises');
+const { Readable } = require('stream');
 const {
   isValidYouTubeUrl,
   extractYouTubeId,
   sanitizeFilename,
   formatFileSize,
-  findBrowserExecutable
+  findBrowserExecutable,
+  getMemoryMetrics
 } = require('./utils');
 
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 Edg/122.0.0.0';
+const CURL_BIN = process.platform === 'win32' ? 'curl.exe' : 'curl';
+
+/**
+ * Downloads a byte range or single stream into a local file
+ */
+async function streamToFile(url, filePath, headers = {}, timeoutMs = 60000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const res = await fetch(url, {
+      headers: {
+        'User-Agent': UA,
+        'Referer': 'https://youaudiodown.com/',
+        ...headers
+      },
+      signal: controller.signal
+    });
+
+    if (!res.ok && res.status !== 206) {
+      throw new Error(`HTTP download failed with status ${res.status} (${res.statusText})`);
+    }
+
+    const fileStream = fs.createWriteStream(filePath);
+    await pipeline(Readable.fromWeb(res.body), fileStream);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Fallback to curl if native fetch experiences protocol or network errors
+ */
+function curlFallback(url, filePath, range = null, timeoutMs = 60000) {
+  const args = [
+    '-4',
+    '-L',
+    '-s',
+    '-H', `User-Agent: ${UA}`,
+    '-H', 'Referer: https://youaudiodown.com/'
+  ];
+
+  if (range) {
+    args.push('-r', range);
+  }
+
+  args.push(url, '-o', filePath);
+  execFileSync(CURL_BIN, args, { timeout: timeoutMs });
+}
 
 /**
  * Downloads audio file using chunked Range requests or fallback stream
  */
 async function downloadMediaFile(mediaUrl, totalBytes, targetPath, onProgress) {
-  // If we know the total size and it's large, download in chunks for speed
   const CHUNK_SIZE = 1024 * 1024; // 1 MB chunks
   const numChunks = (totalBytes && totalBytes > 0) ? Math.ceil(totalBytes / CHUNK_SIZE) : 1;
 
@@ -38,32 +89,31 @@ async function downloadMediaFile(mediaUrl, totalBytes, targetPath, onProgress) {
           });
         }
 
-        execFileSync('curl.exe', [
-          '-4',
-          '-L',
-          '-s',
-          '-r', `${start}-${end}`,
-          '-H', `User-Agent: ${UA}`,
-          '-H', 'Referer: https://youaudiodown.com/',
-          mediaUrl,
-          '-o', partPath
-        ], { timeout: 45000 });
+        try {
+          await streamToFile(mediaUrl, partPath, { 'Range': `bytes=${start}-${end}` }, 45000);
+        } catch (fetchErr) {
+          // Fallback to curl binary if fetch fails
+          curlFallback(mediaUrl, partPath, `${start}-${end}`, 45000);
+        }
       }
 
-      // Merge parts
+      // Merge parts into targetPath using streaming (avoids buffering large files in RAM)
       if (onProgress) {
         onProgress({ phase: 'downloading', percent: 92, message: 'Assembling audio stream...' });
       }
 
       const outStream = fs.createWriteStream(targetPath);
       for (const part of tempParts) {
-        const partBuffer = fs.readFileSync(part);
-        outStream.write(partBuffer);
-        fs.unlinkSync(part);
+        const inStream = fs.createReadStream(part);
+        await new Promise((resolve, reject) => {
+          inStream.pipe(outStream, { end: false });
+          inStream.on('end', resolve);
+          inStream.on('error', reject);
+        });
+        try { fs.unlinkSync(part); } catch (e) {}
       }
       outStream.end();
 
-      // Wait for stream to finish flushing
       await new Promise((resolve, reject) => {
         outStream.on('finish', resolve);
         outStream.on('error', reject);
@@ -71,8 +121,7 @@ async function downloadMediaFile(mediaUrl, totalBytes, targetPath, onProgress) {
 
       return;
     } catch (chunkErr) {
-      // Clean up temp parts and attempt fallback
-      tempParts.forEach(p => { if (fs.existsSync(p)) fs.unlinkSync(p); });
+      tempParts.forEach(p => { if (fs.existsSync(p)) { try { fs.unlinkSync(p); } catch (e) {} } });
       console.warn('Chunked download encountered error, trying single-stream fallback:', chunkErr.message);
     }
   }
@@ -82,15 +131,11 @@ async function downloadMediaFile(mediaUrl, totalBytes, targetPath, onProgress) {
     onProgress({ phase: 'downloading', percent: 70, message: 'Downloading audio stream directly...' });
   }
 
-  execFileSync('curl.exe', [
-    '-4',
-    '-L',
-    '-s',
-    '-H', `User-Agent: ${UA}`,
-    '-H', 'Referer: https://youaudiodown.com/',
-    mediaUrl,
-    '-o', targetPath
-  ], { timeout: 120000 });
+  try {
+    await streamToFile(mediaUrl, targetPath, {}, 120000);
+  } catch (fetchErr) {
+    curlFallback(mediaUrl, targetPath, null, 120000);
+  }
 }
 
 /**
@@ -134,6 +179,7 @@ async function processYouTubeDownload(youtubeUrl, options = {}) {
 
   let browser = null;
   let page = null;
+  let targetFilePath = null;
   const startTime = Date.now();
 
   try {
@@ -143,6 +189,9 @@ async function processYouTubeDownload(youtubeUrl, options = {}) {
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--no-zygote',
         '--disable-blink-features=AutomationControlled',
         '--window-size=1280,800'
       ]
@@ -154,21 +203,27 @@ async function processYouTubeDownload(youtubeUrl, options = {}) {
       Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
     });
 
-    // Capture the API response from the site
+    // Capture the API response from the site safely
     let apiData = null;
     let apiError = null;
 
     page.on('response', async (res) => {
       if (res.url().includes('/api/youtube/audio-video/audio/new') && res.request().method() === 'POST') {
         try {
-          const json = await res.json();
-          if (json.status === 'success' && json.data) {
-            apiData = json.data;
-          } else if (json.message || json.status === 'error') {
-            apiError = json.message || 'API processing error';
+          const status = res.status();
+          const contentType = res.headers()['content-type'] || '';
+          if (contentType.includes('application/json')) {
+            const json = await res.json();
+            if (json.status === 'success' && json.data) {
+              apiData = json.data;
+            } else if (json.message || json.status === 'error') {
+              apiError = json.message || 'API conversion failed';
+            }
+          } else {
+            apiError = `External conversion API returned unexpected HTTP ${status} (${contentType})`;
           }
         } catch (e) {
-          // ignore parsing error
+          apiError = `Failed to process external response: ${e.message}`;
         }
       }
     });
@@ -297,7 +352,7 @@ async function processYouTubeDownload(youtubeUrl, options = {}) {
     }
 
     const filename = sanitizeFilename(title, ext);
-    const targetFilePath = path.join(downloadsDir, filename);
+    targetFilePath = path.join(downloadsDir, filename);
 
     // 8. Download audio file to dedicated downloads folder
     onProgress({
@@ -323,6 +378,9 @@ async function processYouTubeDownload(youtubeUrl, options = {}) {
     }
 
     const durationSeconds = Math.round((Date.now() - startTime) / 1000);
+    const mem = getMemoryMetrics();
+    console.log(`[Download Verified] ${filename} (${formatFileSize(stat.size)}) in ${durationSeconds}s | RSS: ${mem.rssMb}MB`);
+
     const result = {
       success: true,
       filename,
@@ -347,6 +405,16 @@ async function processYouTubeDownload(youtubeUrl, options = {}) {
 
     return result;
 
+  } catch (err) {
+    if (targetFilePath && fs.existsSync(targetFilePath)) {
+      try {
+        const s = fs.statSync(targetFilePath);
+        if (s.size === 0) {
+          fs.unlinkSync(targetFilePath);
+        }
+      } catch (e) {}
+    }
+    throw err;
   } finally {
     if (browser) {
       try {

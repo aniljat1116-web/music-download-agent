@@ -72,17 +72,43 @@ function formatFileSize(bytes) {
 }
 
 /**
- * Locate Chrome or Edge executable on Windows
+ * Locate Chrome, Chromium, or Edge executable across OS platforms
  */
 function findBrowserExecutable() {
+  // 1. Explicit environment variable override
+  if (process.env.PUPPETEER_EXECUTABLE_PATH && fs.existsSync(process.env.PUPPETEER_EXECUTABLE_PATH)) {
+    return process.env.PUPPETEER_EXECUTABLE_PATH;
+  }
+  if (process.env.CHROME_BIN && fs.existsSync(process.env.CHROME_BIN)) {
+    return process.env.CHROME_BIN;
+  }
+  if (process.env.CHROME_PATH && fs.existsSync(process.env.CHROME_PATH)) {
+    return process.env.CHROME_PATH;
+  }
+
+  // 2. Candidate paths across Linux, Windows, macOS
   const candidatePaths = [
+    // Linux standard paths
+    '/usr/bin/google-chrome',
+    '/usr/bin/google-chrome-stable',
+    '/usr/bin/chromium',
+    '/usr/bin/chromium-browser',
+    '/snap/bin/chromium',
+    '/usr/lib/chromium/chromium',
+
+    // Windows paths
     'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
     'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
     'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
     'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
     path.join(process.env.LOCALAPPDATA || '', 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
     path.join(process.env.LOCALAPPDATA || '', 'Google', 'Chrome', 'Application', 'chrome.exe'),
-    path.join(process.env.PROGRAMFILES || '', 'BraveSoftware', 'Brave-Browser', 'Application', 'brave.exe')
+    path.join(process.env.PROGRAMFILES || '', 'BraveSoftware', 'Brave-Browser', 'Application', 'brave.exe'),
+
+    // macOS paths
+    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+    '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+    '/Applications/Chromium.app/Contents/MacOS/Chromium'
   ];
 
   for (const p of candidatePaths) {
@@ -94,10 +120,23 @@ function findBrowserExecutable() {
   return null;
 }
 
+/**
+ * Safe process memory and uptime metrics
+ */
+function getMemoryMetrics() {
+  const mem = process.memoryUsage();
+  return {
+    rssMb: parseFloat((mem.rss / 1024 / 1024).toFixed(2)),
+    heapUsedMb: parseFloat((mem.heapUsed / 1024 / 1024).toFixed(2)),
+    heapTotalMb: parseFloat((mem.heapTotal / 1024 / 1024).toFixed(2))
+  };
+}
+
 module.exports = {
   extractYouTubeId,
   isValidYouTubeUrl,
   sanitizeFilename,
   formatFileSize,
-  findBrowserExecutable
+  findBrowserExecutable,
+  getMemoryMetrics
 };

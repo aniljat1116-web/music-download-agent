@@ -3,11 +3,20 @@ const cors = require('cors');
 const path = require('path');
 const fs = require('fs');
 const { processYouTubeDownload } = require('./browserAgent');
-const { formatFileSize, isValidYouTubeUrl } = require('./utils');
+const {
+  formatFileSize,
+  isValidYouTubeUrl,
+  extractYouTubeId,
+  getMemoryMetrics
+} = require('./utils');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
-const DOWNLOADS_DIR = path.resolve(__dirname, '..', 'downloads');
+const HOST = process.env.HOST || '0.0.0.0';
+const API_KEY = process.env.API_KEY || null;
+const MAX_CONCURRENT_JOBS = parseInt(process.env.MAX_CONCURRENT_JOBS || '1', 10);
+const JOB_TTL_MS = parseInt(process.env.JOB_TTL_MS || '3600000', 10); // 1 hour TTL
+const DOWNLOADS_DIR = process.env.DOWNLOADS_DIR || path.resolve(__dirname, '..', 'downloads');
 
 if (!fs.existsSync(DOWNLOADS_DIR)) {
   fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
@@ -16,8 +25,62 @@ if (!fs.existsSync(DOWNLOADS_DIR)) {
 app.use(cors());
 app.use(express.json());
 
-// In-memory active and completed jobs
+// In-memory job state and concurrency queue
 const jobs = new Map();
+const jobQueue = [];
+const activeJobs = new Set();
+
+/**
+ * Authentication middleware for sensitive or resource-intensive operations
+ */
+function authenticate(req, res, next) {
+  if (!API_KEY) {
+    return next(); // Unset API_KEY allows unauthenticated development mode
+  }
+
+  const clientKey = req.headers['x-api-key'] ||
+    (req.headers.authorization?.startsWith('Bearer ') ? req.headers.authorization.slice(7) : null);
+
+  if (clientKey && clientKey === API_KEY) {
+    return next();
+  }
+
+  return res.status(401).json({ error: 'Unauthorized: Invalid or missing API key' });
+}
+
+/**
+ * Prune old completed/failed jobs from memory to prevent memory leaks
+ */
+function pruneExpiredJobs() {
+  const now = Date.now();
+  for (const [id, job] of jobs.entries()) {
+    if ((job.status === 'completed' || job.status === 'error') && !activeJobs.has(id)) {
+      const created = new Date(job.createdAt).getTime();
+      if (now - created > JOB_TTL_MS) {
+        jobs.delete(id);
+      }
+    }
+  }
+}
+
+setInterval(pruneExpiredJobs, 10 * 60 * 1000).unref();
+
+/**
+ * Health check endpoint for cloud orchestrators (Kubernetes, Render, Fly.io, Railway)
+ */
+app.get(['/health', '/api/health'], (req, res) => {
+  const mem = getMemoryMetrics();
+  res.json({
+    status: 'healthy',
+    timestamp: new Date().toISOString(),
+    uptimeSeconds: Math.round(process.uptime()),
+    activeJobs: activeJobs.size,
+    queuedJobs: jobQueue.length,
+    totalTrackedJobs: jobs.size,
+    maxConcurrentJobs: MAX_CONCURRENT_JOBS,
+    memory: mem
+  });
+});
 
 /**
  * Validate URL endpoint
@@ -27,32 +90,175 @@ app.post('/api/validate', (req, res) => {
   if (!url) {
     return res.status(400).json({ valid: false, error: 'URL is required' });
   }
-  const valid = isValidYouTubeUrl(url);
-  return res.json({ valid, url });
+  const videoId = extractYouTubeId(url);
+  const valid = Boolean(videoId);
+  return res.json({ valid, videoId, url });
 });
 
 /**
- * Start a download job
+ * Helper to emit SSE progress updates to connected clients
  */
-app.post('/api/download', (req, res) => {
+function emitJobProgress(job, event) {
+  job.status = event.phase;
+  job.percent = event.percent != null ? event.percent : job.percent;
+  job.message = event.message || job.message;
+  job.logs.push({
+    timestamp: new Date().toLocaleTimeString(),
+    phase: event.phase,
+    percent: event.percent,
+    message: event.message
+  });
+
+  if (event.data) {
+    job.data = { ...(job.data || {}), ...event.data };
+  }
+
+  const payload = `data: ${JSON.stringify({
+    jobId: job.id,
+    status: job.status,
+    percent: job.percent,
+    message: job.message,
+    data: job.data || null
+  })}\n\n`;
+
+  job.sseClients.forEach(client => {
+    try {
+      client.write(payload);
+    } catch (e) {}
+  });
+}
+
+/**
+ * Executes a single queued download job
+ */
+async function runJob(jobId) {
+  const job = jobs.get(jobId);
+  if (!job) return;
+
+  activeJobs.add(jobId);
+  const startTime = Date.now();
+
+  try {
+    const result = await processYouTubeDownload(job.url, {
+      downloadsDir: DOWNLOADS_DIR,
+      onProgress: (event) => emitJobProgress(job, event)
+    });
+
+    job.status = 'completed';
+    job.result = result;
+    job.percent = 100;
+    job.message = 'Audio successfully downloaded and verified!';
+
+    const donePayload = `data: ${JSON.stringify({
+      jobId,
+      status: 'completed',
+      percent: 100,
+      message: job.message,
+      result
+    })}\n\n`;
+
+    job.sseClients.forEach(c => {
+      try {
+        c.write(donePayload);
+        c.end();
+      } catch (e) {}
+    });
+    job.sseClients = [];
+
+  } catch (err) {
+    job.status = 'error';
+    job.error = err.message || 'An unexpected error occurred during download';
+    job.message = job.error;
+    job.logs.push({
+      timestamp: new Date().toLocaleTimeString(),
+      phase: 'error',
+      message: job.error
+    });
+
+    const errPayload = `data: ${JSON.stringify({
+      jobId,
+      status: 'error',
+      percent: job.percent,
+      error: job.error
+    })}\n\n`;
+
+    job.sseClients.forEach(c => {
+      try {
+        c.write(errPayload);
+        c.end();
+      } catch (e) {}
+    });
+    job.sseClients = [];
+
+  } finally {
+    activeJobs.delete(jobId);
+    processNextJob();
+  }
+}
+
+/**
+ * Process next job from FIFO queue if workers are available
+ */
+function processNextJob() {
+  if (activeJobs.size >= MAX_CONCURRENT_JOBS || jobQueue.length === 0) {
+    return;
+  }
+
+  const nextJobId = jobQueue.shift();
+  runJob(nextJobId);
+}
+
+/**
+ * Start a download job with concurrency queue and duplicate detection
+ */
+app.post('/api/download', authenticate, (req, res) => {
   const { url } = req.body;
   if (!url) {
     return res.status(400).json({ error: 'YouTube URL is required' });
   }
 
-  if (!isValidYouTubeUrl(url)) {
+  const videoId = extractYouTubeId(url);
+  if (!videoId) {
     return res.status(400).json({
       error: 'Invalid YouTube URL. Please enter a valid YouTube video link (e.g., https://www.youtube.com/watch?v=...)'
     });
   }
 
+  // Prevent duplicate concurrent processing of the exact same video
+  for (const activeId of activeJobs) {
+    const existing = jobs.get(activeId);
+    if (existing && existing.videoId === videoId) {
+      return res.json({
+        jobId: existing.id,
+        videoId,
+        status: existing.status,
+        message: 'A download for this video is already in progress'
+      });
+    }
+  }
+
+  for (const queuedId of jobQueue) {
+    const existing = jobs.get(queuedId);
+    if (existing && existing.videoId === videoId) {
+      return res.json({
+        jobId: existing.id,
+        videoId,
+        status: 'queued',
+        message: 'A download for this video is already queued'
+      });
+    }
+  }
+
   const jobId = `job_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+  const isQueued = activeJobs.size >= MAX_CONCURRENT_JOBS;
+
   const job = {
     id: jobId,
+    videoId,
     url,
-    status: 'pending',
+    status: isQueued ? 'queued' : 'pending',
     percent: 0,
-    message: 'Job initialized',
+    message: isQueued ? 'Job queued (waiting for worker slot)...' : 'Job initialized',
     logs: [],
     result: null,
     error: null,
@@ -62,90 +268,19 @@ app.post('/api/download', (req, res) => {
 
   jobs.set(jobId, job);
 
-  // Helper to broadcast progress
-  const emitProgress = (event) => {
-    job.status = event.phase;
-    job.percent = event.percent || job.percent;
-    job.message = event.message || job.message;
-    job.logs.push({
-      timestamp: new Date().toLocaleTimeString(),
-      phase: event.phase,
-      percent: event.percent,
-      message: event.message
-    });
+  if (isQueued) {
+    jobQueue.push(jobId);
+  } else {
+    runJob(jobId);
+  }
 
-    if (event.data) {
-      job.data = { ...(job.data || {}), ...event.data };
-    }
-
-    const payload = `data: ${JSON.stringify({
-      jobId,
-      status: job.status,
-      percent: job.percent,
-      message: job.message,
-      data: job.data || null
-    })}\n\n`;
-
-    job.sseClients.forEach(client => {
-      try {
-        client.write(payload);
-      } catch (e) {}
-    });
-  };
-
-  // Run the agent in background
-  (async () => {
-    try {
-      const result = await processYouTubeDownload(url, {
-        downloadsDir: DOWNLOADS_DIR,
-        onProgress: emitProgress
-      });
-      job.status = 'completed';
-      job.result = result;
-      job.percent = 100;
-      job.message = 'Audio successfully downloaded and verified!';
-      
-      const donePayload = `data: ${JSON.stringify({
-        jobId,
-        status: 'completed',
-        percent: 100,
-        message: job.message,
-        result
-      })}\n\n`;
-      job.sseClients.forEach(c => {
-        try {
-          c.write(donePayload);
-          c.end();
-        } catch (e) {}
-      });
-      job.sseClients = [];
-    } catch (err) {
-      job.status = 'error';
-      job.error = err.message || 'An unexpected error occurred during download';
-      job.message = job.error;
-      job.logs.push({
-        timestamp: new Date().toLocaleTimeString(),
-        phase: 'error',
-        message: job.error
-      });
-
-      const errPayload = `data: ${JSON.stringify({
-        jobId,
-        status: 'error',
-        percent: job.percent,
-        error: job.error
-      })}\n\n`;
-      job.sseClients.forEach(c => {
-        try {
-          c.write(errPayload);
-          c.end();
-        } catch (e) {}
-      });
-      job.sseClients = [];
-    }
-  })();
-
-  res.json({ jobId, status: 'started' });
+  res.json({
+    jobId,
+    videoId,
+    status: job.status,
+    queued: isQueued,
+    queuePosition: isQueued ? jobQueue.length : 0
+  });
 });
 
 /**
@@ -164,7 +299,7 @@ app.get('/api/progress/:jobId', (req, res) => {
   res.setHeader('Connection', 'keep-alive');
   res.flushHeaders();
 
-  // Send current state
+  // Send current state immediately
   res.write(`data: ${JSON.stringify({
     jobId,
     status: job.status,
@@ -199,6 +334,7 @@ app.get('/api/status/:jobId', (req, res) => {
 
   res.json({
     id: job.id,
+    videoId: job.videoId,
     status: job.status,
     percent: job.percent,
     message: job.message,
@@ -216,7 +352,7 @@ app.get('/api/downloads', (req, res) => {
   try {
     const files = fs.readdirSync(DOWNLOADS_DIR);
     const fileList = files
-      .filter(f => !f.endsWith('.part') && !f.includes('.part') && !f.endsWith('.tmp'))
+      .filter(f => !f.endsWith('.part') && !f.includes('.part') && !f.endsWith('.tmp') && f !== '.gitkeep')
       .map(filename => {
         const fullPath = path.join(DOWNLOADS_DIR, filename);
         const stats = fs.statSync(fullPath);
@@ -241,7 +377,6 @@ app.get('/api/downloads', (req, res) => {
  */
 app.get('/api/downloads/:filename', (req, res) => {
   const { filename } = req.params;
-  // Prevent directory traversal
   const safeFilename = path.basename(filename);
   const filePath = path.join(DOWNLOADS_DIR, safeFilename);
 
@@ -284,7 +419,7 @@ app.get('/api/downloads/:filename', (req, res) => {
 /**
  * Delete a downloaded file
  */
-app.delete('/api/downloads/:filename', (req, res) => {
+app.delete('/api/downloads/:filename', authenticate, (req, res) => {
   const { filename } = req.params;
   const safeFilename = path.basename(filename);
   const filePath = path.join(DOWNLOADS_DIR, safeFilename);
@@ -310,11 +445,28 @@ if (fs.existsSync(clientDist)) {
   });
 }
 
+let server = null;
 if (require.main === module) {
-  app.listen(PORT, () => {
-    console.log(`🎵 Music Download Agent Server running on http://localhost:${PORT}`);
+  server = app.listen(PORT, HOST, () => {
+    console.log(`🎵 Music Download Agent Server running on http://${HOST}:${PORT}`);
     console.log(`📁 Downloads folder: ${DOWNLOADS_DIR}`);
+    console.log(`🔒 Authentication: ${API_KEY ? 'Enabled' : 'Disabled (Public/Dev mode)'}`);
+    console.log(`⚡ Max concurrent jobs: ${MAX_CONCURRENT_JOBS}`);
   });
+
+  const gracefulShutdown = () => {
+    console.log('\nReceived shutdown signal. Closing server...');
+    if (server) {
+      server.close(() => {
+        console.log('HTTP server closed.');
+        process.exit(0);
+      });
+      setTimeout(() => process.exit(0), 5000).unref();
+    }
+  };
+
+  process.on('SIGTERM', gracefulShutdown);
+  process.on('SIGINT', gracefulShutdown);
 }
 
 module.exports = app;

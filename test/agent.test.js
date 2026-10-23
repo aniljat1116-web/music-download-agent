@@ -90,10 +90,18 @@ async function runTests() {
     assert.strictEqual(formatFileSize(3449447), '3.29 MB');
   });
 
-  test('Detect Chromium/Edge browser on Windows', () => {
+  test('Detect Chromium or Edge browser across platforms', () => {
     const browserPath = findBrowserExecutable();
-    assert(browserPath !== null, 'Browser executable should be found on this Windows system');
+    assert(browserPath !== null, 'Browser executable should be found');
     assert(fs.existsSync(browserPath), `Executable at ${browserPath} must exist`);
+  });
+
+  test('Support PUPPETEER_EXECUTABLE_PATH override', () => {
+    const currentPath = findBrowserExecutable();
+    process.env.PUPPETEER_EXECUTABLE_PATH = currentPath;
+    const resolved = findBrowserExecutable();
+    assert.strictEqual(resolved, currentPath, 'Should resolve environment variable override');
+    delete process.env.PUPPETEER_EXECUTABLE_PATH;
   });
 
   console.log('\n--- 3. End-to-End Browser Automation & Download Test ---');

@@ -7,7 +7,7 @@
     "start": "node server/index.js",
     "server": "node server/index.js",
     "client": "cd client && npm run dev",
-    "build": "cd client && npm run build",
+    "build": "npm --prefix client install && npm --prefix client run build",
     "test": "node test/api.test.js && node test/agent.test.js"
   },
   "keywords": [

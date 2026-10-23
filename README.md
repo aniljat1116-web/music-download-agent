@@ -158,13 +158,49 @@ File Size: 3.29 MB (3449447 bytes)
 Elapsed Time: 15s
 
 ==================================================
-🏁 TEST RESULTS: 9/9 PASSED
+🏁 TEST RESULTS: 10/10 PASSED
 ==================================================
 ```
 
 ---
 
+## 🐳 Docker & Cloud Deployment
+
+### 1. Build and Run Container Locally
+```bash
+docker build -t music-download-agent .
+docker run -d -p 5000:5000 --name music-agent music-download-agent
+```
+
+### 2. Environment Variables Configuration
+
+Copy `.env.example` to `.env` or configure them in your cloud hosting provider dashboard:
+
+| Variable | Default | Description |
+|---|---|---|
+| `PORT` | `5000` | Port on which the HTTP server listens |
+| `HOST` | `0.0.0.0` | Network interface to bind |
+| `API_KEY` | *(empty)* | Optional authorization token. When set, requires `x-api-key` header on download and delete endpoints |
+| `MAX_CONCURRENT_JOBS` | `1` | Maximum parallel browser instances before jobs queue |
+| `JOB_TTL_MS` | `3600000` | Memory retention duration for completed/errored jobs (1 hour) |
+| `PUPPETEER_EXECUTABLE_PATH` | `/usr/bin/chromium` | System path to Chromium or Google Chrome binary |
+| `DOWNLOADS_DIR` | `./downloads` | Path to persistent storage volume for audio files |
+
+---
+
 ## 📡 API Reference
+
+### `GET /health`
+Cloud orchestrator liveness and readiness probe.
+```json
+{
+  "status": "healthy",
+  "uptimeSeconds": 120,
+  "activeJobs": 0,
+  "queuedJobs": 0,
+  "memory": { "rssMb": 65.4, "heapUsedMb": 32.1 }
+}
+```
 
 ### `POST /api/validate`
 Validates whether a URL or ID is a valid YouTube video.

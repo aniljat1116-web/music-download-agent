@@ -6,6 +6,14 @@ async function testApi() {
   const server = app.listen(5099);
 
   try {
+    // Test 0: /health endpoint
+    const healthRes = await fetch('http://localhost:5099/health');
+    const healthJson = await healthRes.json();
+    assert.strictEqual(healthJson.status, 'healthy', 'Health endpoint status must be healthy');
+    assert(typeof healthJson.uptimeSeconds === 'number', 'Uptime must be a number');
+    assert(typeof healthJson.memory === 'object', 'Memory metrics must be present');
+    console.log('✅ GET /health [Health check] passed');
+
     // Test 1: /api/validate
     const validRes = await fetch('http://localhost:5099/api/validate', {
       method: 'POST',
