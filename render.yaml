@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: music-download-agent
+    runtime: docker
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: API_KEY
+        generateValue: true
+      - key: MAX_CONCURRENT_JOBS
+        value: "1"
+      - key: NODE_ENV
+        value: production
