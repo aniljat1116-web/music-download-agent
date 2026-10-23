@@ -1,0 +1,28 @@
+{
+  "name": "music-download-agent",
+  "version": "1.0.0",
+  "description": "Standalone YouTube Music Download Agent using React, Node.js/Express, and Puppeteer",
+  "main": "server/index.js",
+  "scripts": {
+    "start": "node server/index.js",
+    "server": "node server/index.js",
+    "client": "cd client && npm run dev",
+    "build": "cd client && npm run build",
+    "test": "node test/api.test.js && node test/agent.test.js"
+  },
+  "keywords": [
+    "youtube",
+    "music-downloader",
+    "puppeteer",
+    "browser-automation",
+    "react",
+    "express"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "puppeteer-core": "^24.4.0"
+  }
+}
