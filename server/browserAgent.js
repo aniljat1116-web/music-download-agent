@@ -17,11 +17,41 @@ const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,
 const CURL_BIN = process.platform === 'win32' ? 'curl.exe' : 'curl';
 
 /**
+ * Clean up temporary or incomplete download files from disk
+ */
+function cleanupTempFiles(targetPath) {
+  if (!targetPath) return;
+  try {
+    const dir = path.dirname(targetPath);
+    const base = path.basename(targetPath);
+    if (fs.existsSync(dir)) {
+      const files = fs.readdirSync(dir);
+      for (const file of files) {
+        if (file.startsWith(base + '.part') || file.startsWith(base + '.tmp')) {
+          try {
+            fs.unlinkSync(path.join(dir, file));
+          } catch (e) {}
+        }
+      }
+    }
+    if (fs.existsSync(targetPath)) {
+      try {
+        const stat = fs.statSync(targetPath);
+        if (stat.size === 0) {
+          fs.unlinkSync(targetPath);
+        }
+      } catch (e) {}
+    }
+  } catch (e) {}
+}
+
+/**
  * Downloads a byte range or single stream into a local file
  */
 async function streamToFile(url, filePath, headers = {}, timeoutMs = 60000) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let fileStream = null;
 
   try {
     const res = await fetch(url, {
@@ -34,13 +64,17 @@ async function streamToFile(url, filePath, headers = {}, timeoutMs = 60000) {
     });
 
     if (!res.ok && res.status !== 206) {
-      throw new Error(`HTTP download failed with status ${res.status} (${res.statusText})`);
+      const contentType = res.headers.get('content-type') || '';
+      throw new Error(`HTTP download failed with status ${res.status} (${res.statusText || 'Error'}, Content-Type: ${contentType})`);
     }
 
-    const fileStream = fs.createWriteStream(filePath);
+    fileStream = fs.createWriteStream(filePath);
     await pipeline(Readable.fromWeb(res.body), fileStream);
   } finally {
     clearTimeout(timer);
+    if (fileStream && !fileStream.destroyed) {
+      fileStream.destroy();
+    }
   }
 }
 
@@ -103,21 +137,27 @@ async function downloadMediaFile(mediaUrl, totalBytes, targetPath, onProgress) {
       }
 
       const outStream = fs.createWriteStream(targetPath);
-      for (const part of tempParts) {
-        const inStream = fs.createReadStream(part);
-        await new Promise((resolve, reject) => {
-          inStream.pipe(outStream, { end: false });
-          inStream.on('end', resolve);
-          inStream.on('error', reject);
-        });
-        try { fs.unlinkSync(part); } catch (e) {}
-      }
-      outStream.end();
+      try {
+        for (const part of tempParts) {
+          const inStream = fs.createReadStream(part);
+          await new Promise((resolve, reject) => {
+            inStream.pipe(outStream, { end: false });
+            inStream.on('end', resolve);
+            inStream.on('error', reject);
+          });
+          try { fs.unlinkSync(part); } catch (e) {}
+        }
+        outStream.end();
 
-      await new Promise((resolve, reject) => {
-        outStream.on('finish', resolve);
-        outStream.on('error', reject);
-      });
+        await new Promise((resolve, reject) => {
+          outStream.on('finish', resolve);
+          outStream.on('error', reject);
+        });
+      } finally {
+        if (!outStream.destroyed) {
+          outStream.destroy();
+        }
+      }
 
       return;
     } catch (chunkErr) {
@@ -144,45 +184,64 @@ async function downloadMediaFile(mediaUrl, totalBytes, targetPath, onProgress) {
 async function processYouTubeDownload(youtubeUrl, options = {}) {
   const downloadsDir = options.downloadsDir || path.join(__dirname, '..', 'downloads');
   const onProgress = options.onProgress || (() => {});
+  const conversionTimeout = options.conversionTimeout || 40000;
   const overallTimeoutMs = options.timeout || 90000;
 
   if (!fs.existsSync(downloadsDir)) {
     fs.mkdirSync(downloadsDir, { recursive: true });
   }
 
-  // 1. Validate YouTube URL
-  onProgress({ phase: 'validating', percent: 5, message: 'Validating YouTube URL...' });
-  const videoId = extractYouTubeId(youtubeUrl);
-  if (!videoId) {
-    throw new Error('Invalid YouTube video URL. Please provide a valid YouTube link (e.g., https://www.youtube.com/watch?v=...)');
-  }
+  const startTime = Date.now();
+  let currentStage = 'validating';
 
-  const normalizedUrl = `https://www.youtube.com/watch?v=${videoId}`;
-  onProgress({
-    phase: 'validating',
-    percent: 10,
-    message: `URL validated (Video ID: ${videoId})`,
-    data: { videoId, normalizedUrl }
-  });
+  // Structured timestamped stage logger (no secrets)
+  const logStage = (stage, percent, message, data = null) => {
+    currentStage = stage;
+    const elapsedMs = Date.now() - startTime;
+    const elapsedSec = (elapsedMs / 1000).toFixed(1);
+    const timestamp = new Date().toISOString();
+    console.log(`[${timestamp}] [Stage: ${stage}] (+${elapsedSec}s) ${message}`);
+    onProgress({
+      timestamp,
+      phase: stage,
+      percent,
+      elapsedMs,
+      message,
+      ...(data ? { data } : {})
+    });
+  };
 
-  // 2. Find browser executable
-  const browserPath = findBrowserExecutable();
-  if (!browserPath) {
-    throw new Error('No compatible Chromium browser (Microsoft Edge or Google Chrome) found on this Windows system.');
-  }
-
-  onProgress({
-    phase: 'launching_browser',
-    percent: 15,
-    message: `Launching browser automation (${path.basename(browserPath)})...`
+  let overallTimer = null;
+  const overallTimeoutPromise = new Promise((_, reject) => {
+    overallTimer = setTimeout(() => {
+      const elapsedSec = Math.round((Date.now() - startTime) / 1000);
+      reject(new Error(`[Stage: ${currentStage}] Workflow timed out after ${elapsedSec}s (overall limit ${Math.round(overallTimeoutMs / 1000)}s)`));
+    }, overallTimeoutMs);
   });
 
   let browser = null;
   let page = null;
   let targetFilePath = null;
-  const startTime = Date.now();
 
-  try {
+  const runWorkflow = async () => {
+    // 1. Validate YouTube URL
+    logStage('validating', 5, 'Validating YouTube URL...');
+    const videoId = extractYouTubeId(youtubeUrl);
+    if (!videoId) {
+      throw new Error('[Stage: validating] Invalid YouTube video URL. Please provide a valid YouTube link (e.g., https://www.youtube.com/watch?v=...)');
+    }
+
+    const normalizedUrl = `https://www.youtube.com/watch?v=${videoId}`;
+    logStage('validating', 10, `URL validated (Video ID: ${videoId})`, { videoId, normalizedUrl });
+
+    // 2. Find browser executable
+    const browserPath = findBrowserExecutable();
+    if (!browserPath) {
+      throw new Error('[Stage: launching_browser] No compatible Chromium browser (Microsoft Edge or Google Chrome) found on this system.');
+    }
+
+    logStage('launching_browser', 15, `Launching browser automation (${path.basename(browserPath)})...`);
+
     browser = await puppeteer.launch({
       executablePath: browserPath,
       headless: "new",
@@ -203,77 +262,168 @@ async function processYouTubeDownload(youtubeUrl, options = {}) {
       Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
     });
 
-    // Capture the API response from the site safely
+    // Capture browser and network errors safely
     let apiData = null;
     let apiError = null;
 
+    page.on('pageerror', (pageErr) => {
+      const msg = pageErr ? pageErr.message : 'Unknown browser script error';
+      console.warn(`[${new Date().toISOString()}] [Browser Page Error] ${msg}`);
+    });
+
+    page.on('requestfailed', (failedReq) => {
+      const reqUrl = failedReq.url();
+      const failure = failedReq.failure();
+      if (reqUrl.includes('youaudiodown.com') || reqUrl.includes('theeztools.com') || reqUrl.includes('challenges.cloudflare.com')) {
+        console.warn(`[${new Date().toISOString()}] [Network Failure] ${failedReq.method()} ${reqUrl} - ${failure ? failure.errorText : 'failed'}`);
+      }
+    });
+
     page.on('response', async (res) => {
-      if (res.url().includes('/api/youtube/audio-video/audio/new') && res.request().method() === 'POST') {
+      const resUrl = res.url();
+      if (resUrl.includes('/api/youtube/audio-video/audio/new') && res.request().method() === 'POST') {
+        const status = res.status();
+        const contentType = res.headers()['content-type'] || '';
         try {
-          const status = res.status();
-          const contentType = res.headers()['content-type'] || '';
           if (contentType.includes('application/json')) {
-            const json = await res.json();
-            if (json.status === 'success' && json.data) {
-              apiData = json.data;
-            } else if (json.message || json.status === 'error') {
-              apiError = json.message || 'API conversion failed';
+            const json = await res.json().catch(() => null);
+            if (json) {
+              if (json.status === 'success' && json.data) {
+                apiData = json.data;
+                console.log(`[${new Date().toISOString()}] [External API Success] HTTP ${status} (${contentType})`);
+              } else {
+                const msg = json.message || json.error || json.detail || JSON.stringify(json);
+                apiError = `External conversion API error (HTTP ${status}, ${contentType}): ${msg}`;
+                console.warn(`[${new Date().toISOString()}] [External API Error] ${apiError}`);
+              }
+            } else {
+              apiError = `External conversion API returned unparseable JSON (HTTP ${status})`;
             }
           } else {
-            apiError = `External conversion API returned unexpected HTTP ${status} (${contentType})`;
+            const bodySnippet = await res.text().catch(() => '');
+            apiError = `External conversion API returned unexpected HTTP ${status} (${contentType}): ${bodySnippet.slice(0, 150).trim()}`;
+            console.warn(`[${new Date().toISOString()}] [External API Error] ${apiError}`);
           }
         } catch (e) {
-          apiError = `Failed to process external response: ${e.message}`;
+          apiError = `Failed to process external response (HTTP ${status}): ${e.message}`;
         }
       }
     });
 
     // 3. Navigate to https://youaudiodown.com/
-    onProgress({ phase: 'navigating', percent: 25, message: 'Navigating to https://youaudiodown.com/ ...' });
-    await page.goto('https://youaudiodown.com/', { waitUntil: 'networkidle2', timeout: 35000 });
+    logStage('navigating', 25, 'Navigating to https://youaudiodown.com/ ...');
+    let navResponse = null;
+    try {
+      navResponse = await page.goto('https://youaudiodown.com/', { waitUntil: 'networkidle2', timeout: 35000 });
+    } catch (navErr) {
+      throw new Error(`[Stage: navigating] Failed to navigate to https://youaudiodown.com/: ${navErr.message}`);
+    }
+
+    if (navResponse) {
+      const status = navResponse.status();
+      const contentType = navResponse.headers()['content-type'] || '';
+      if (!navResponse.ok() && status !== 304) {
+        throw new Error(`[Stage: navigating] External website returned HTTP ${status} (${navResponse.statusText() || 'Error'}, Content-Type: ${contentType})`);
+      }
+    }
+
+    // Check if Cloudflare edge blocked navigation
+    const pageTitle = await page.title().catch(() => '');
+    if (pageTitle.includes('Attention Required!') || pageTitle.includes('Just a moment...') || pageTitle.includes('Access Denied')) {
+      throw new Error(`[Stage: navigating] External website blocked access with Cloudflare challenge page (Title: "${pageTitle}"). Automated access from cloud/datacenter IPs is blocked.`);
+    }
 
     // 4. Wait for input field and enter the URL
-    onProgress({ phase: 'submitting_url', percent: 35, message: 'Entering URL into website input field...' });
-    await page.waitForSelector('#ymdUrlInput', { timeout: 15000 });
-    
-    // Clear any existing input and type the URL
+    logStage('submitting_url', 35, 'Entering URL into website input field...');
+    try {
+      await page.waitForSelector('#ymdUrlInput', { timeout: 15000 });
+    } catch (selErr) {
+      throw new Error('[Stage: submitting_url] Input field #ymdUrlInput not found within 15s. The website structure may have changed.');
+    }
+
     await page.click('#ymdUrlInput', { clickCount: 3 });
     await page.keyboard.press('Backspace');
     await page.type('#ymdUrlInput', normalizedUrl, { delay: 20 });
 
     // 5. Submit the URL
-    onProgress({ phase: 'submitting_url', percent: 40, message: 'Submitting URL and initiating processing...' });
+    logStage('submitting_url', 40, 'Submitting URL and initiating processing...');
     const submitBtn = await page.$('#xrespond-tools-turnstile') || await page.$('.ymd-fetch-btn');
     if (!submitBtn) {
-      throw new Error('Submit button not found on the website interface.');
+      throw new Error('[Stage: submitting_url] Submit button not found on the website interface.');
     }
     await submitBtn.click();
 
-    // 6. Wait for processing to finish (either preview appears or error displays)
-    onProgress({ phase: 'processing', percent: 45, message: 'Waiting for website conversion to complete...' });
+    // 6. Wait for processing to finish (either preview appears, error displays, or anti-bot challenge is detected)
+    logStage('processing', 45, 'Waiting for website conversion to complete...');
 
-    const maxWaitTime = 40000;
+    const maxWaitTime = conversionTimeout;
     const pollInterval = 500;
     let elapsed = 0;
     let previewReady = false;
 
     while (elapsed < maxWaitTime) {
-      // Check DOM state
-      const status = await page.evaluate(() => {
+      // Check DOM state including anti-bot challenges and rate limits
+      const pageState = await page.evaluate(() => {
         const preview = document.getElementById('ymdAudioPreview');
         const err = document.getElementById('ymdErrorMessage');
         const isPreviewVisible = preview && window.getComputedStyle(preview).display !== 'none';
         const hasError = err && window.getComputedStyle(err).display !== 'none' && err.textContent.trim().length > 0;
         const errorText = hasError ? err.textContent.trim() : null;
 
-        return { isPreviewVisible, hasError, errorText };
+        // Check for Cloudflare Turnstile verification challenge
+        const tsHost = document.getElementById('xrespond-tools-turnstile-host');
+        const isTsVisible = tsHost && (tsHost.classList.contains('is-visible') || window.getComputedStyle(tsHost).display !== 'none');
+        const tsError = tsHost?.querySelector('.xrespond-ts-error');
+        const hasTsError = tsError && (tsError.classList.contains('is-visible') || window.getComputedStyle(tsError).display !== 'none');
+        const tsErrorText = hasTsError ? tsError.textContent.trim() : null;
+
+        // Check for Cloudflare captcha widgets or challenge containers
+        const cfWidget = document.querySelector('.cf-turnstile, iframe[src*="challenges.cloudflare.com"]');
+        const cfChallenge = document.getElementById('challenge-running') || document.getElementById('cf-challenge-running');
+
+        // Check for rate limit error container
+        const rlBox = document.getElementById('xrespond-rl-error-container') || document.querySelector('[id*="xrespond-rl-error"]');
+        const isRlVisible = rlBox && window.getComputedStyle(rlBox).display !== 'none';
+        const rlText = isRlVisible ? rlBox.textContent.trim() : null;
+
+        return {
+          isPreviewVisible,
+          hasError,
+          errorText,
+          isTsVisible: Boolean(isTsVisible || cfWidget || cfChallenge),
+          tsErrorText,
+          isRlVisible: Boolean(isRlVisible),
+          rlText
+        };
       });
 
-      if (status.hasError || apiError) {
-        throw new Error(`Website conversion failed: ${status.errorText || apiError}`);
+      // Immediate detection of Cloudflare Turnstile / anti-bot challenges (Requirement 8)
+      if (pageState.isTsVisible) {
+        const detail = pageState.tsErrorText ? ` (${pageState.tsErrorText})` : '';
+        throw new Error(
+          `[Stage: processing] External service blocked automated access: Cloudflare Turnstile human verification challenge detected on youaudiodown.com${detail}. ` +
+          'Cloudflare blocks automated headless browsers from cloud/datacenter IP addresses (e.g., Render). ' +
+          'To ensure reliable downloads in production, please use an authorized YouTube download API, official YouTube Data API, or dedicated yt-dlp backend provider.'
+        );
       }
 
-      if (status.isPreviewVisible || apiData) {
+      // Immediate detection of external rate limit
+      if (pageState.isRlVisible) {
+        throw new Error(`[Stage: processing] External service rate limit exceeded: "${pageState.rlText || 'Rate limit reached on youaudiodown.com'}". Please try again later or use an authorized provider.`);
+      }
+
+      // Check external API response error captured by network listener
+      if (apiError) {
+        throw new Error(`[Stage: processing] ${apiError}`);
+      }
+
+      // Check standard website error message
+      if (pageState.hasError) {
+        throw new Error(`[Stage: processing] Website conversion failed: ${pageState.errorText}`);
+      }
+
+      // Check legitimate completion signal
+      if (pageState.isPreviewVisible || apiData) {
         previewReady = true;
         break;
       }
@@ -283,19 +433,15 @@ async function processYouTubeDownload(youtubeUrl, options = {}) {
 
       // Update progress slightly while waiting
       const waitPct = Math.min(48, Math.round(45 + (elapsed / maxWaitTime) * 5));
-      onProgress({
-        phase: 'processing',
-        percent: waitPct,
-        message: `Converting audio on youaudiodown.com... (${Math.round(elapsed / 1000)}s)`
-      });
+      logStage('processing', waitPct, `Converting audio on youaudiodown.com... (${Math.round(elapsed / 1000)}s)`);
     }
 
     if (!previewReady && !apiData) {
-      throw new Error('Conversion timed out. The website did not finish processing within 40 seconds.');
+      throw new Error(`[Stage: processing] Conversion timed out. The website did not finish processing within ${Math.round(maxWaitTime / 1000)} seconds.`);
     }
 
     // 7. Extract metadata
-    onProgress({ phase: 'processing', percent: 50, message: 'Conversion ready! Extracting audio metadata...' });
+    logStage('processing', 50, 'Conversion ready! Extracting audio metadata...');
 
     const domInfo = await page.evaluate(() => {
       const title = document.getElementById('ymdAudioTitle')?.textContent?.trim() || '';
@@ -340,7 +486,7 @@ async function processYouTubeDownload(youtubeUrl, options = {}) {
     }
 
     if (!mediaUrl) {
-      throw new Error('Unable to extract audio download URL from the page.');
+      throw new Error('[Stage: processing] Unable to extract audio download URL from the page or external API response.');
     }
 
     // If totalSizeBytes wasn't in API, check clen param in mediaUrl
@@ -355,31 +501,34 @@ async function processYouTubeDownload(youtubeUrl, options = {}) {
     targetFilePath = path.join(downloadsDir, filename);
 
     // 8. Download audio file to dedicated downloads folder
-    onProgress({
-      phase: 'downloading',
-      percent: 55,
-      message: `Downloading audio file "${filename}"...`,
-      data: { title, duration, uploader, thumbnail, filename, ext, totalSizeBytes }
+    logStage('downloading', 55, `Downloading audio file "${filename}"...`, {
+      title, duration, uploader, thumbnail, filename, ext, totalSizeBytes
     });
 
-    await downloadMediaFile(mediaUrl, totalSizeBytes, targetFilePath, onProgress);
+    try {
+      await downloadMediaFile(mediaUrl, totalSizeBytes, targetFilePath, (prog) => {
+        logStage('downloading', prog.percent, prog.message);
+      });
+    } catch (dlErr) {
+      throw new Error(`[Stage: downloading] Audio download failed: ${dlErr.message}`);
+    }
 
     // 9. Verify downloaded file exists and is not empty
-    onProgress({ phase: 'verifying', percent: 95, message: 'Verifying downloaded file on disk...' });
+    logStage('verifying', 95, 'Verifying downloaded file on disk...');
 
     if (!fs.existsSync(targetFilePath)) {
-      throw new Error(`Download verification failed: File was not created at ${targetFilePath}`);
+      throw new Error(`[Stage: verifying] Download verification failed: File was not created at ${targetFilePath}`);
     }
 
     const stat = fs.statSync(targetFilePath);
     if (stat.size === 0) {
-      fs.unlinkSync(targetFilePath);
-      throw new Error('Download verification failed: Downloaded file is empty (0 bytes).');
+      cleanupTempFiles(targetFilePath);
+      throw new Error('[Stage: verifying] Download verification failed: Downloaded file is empty (0 bytes).');
     }
 
     const durationSeconds = Math.round((Date.now() - startTime) / 1000);
     const mem = getMemoryMetrics();
-    console.log(`[Download Verified] ${filename} (${formatFileSize(stat.size)}) in ${durationSeconds}s | RSS: ${mem.rssMb}MB`);
+    console.log(`[${new Date().toISOString()}] [Download Verified] ${filename} (${formatFileSize(stat.size)}) in ${durationSeconds}s | RSS: ${mem.rssMb}MB`);
 
     const result = {
       success: true,
@@ -396,36 +545,44 @@ async function processYouTubeDownload(youtubeUrl, options = {}) {
       downloadedAt: new Date().toISOString()
     };
 
-    onProgress({
-      phase: 'completed',
-      percent: 100,
-      message: `Audio successfully downloaded and verified (${result.fileSizeFormatted})!`,
-      data: result
-    });
-
+    logStage('completed', 100, `Audio successfully downloaded and verified (${result.fileSizeFormatted})!`, result);
     return result;
+  };
 
+  try {
+    return await Promise.race([runWorkflow(), overallTimeoutPromise]);
   } catch (err) {
-    if (targetFilePath && fs.existsSync(targetFilePath)) {
-      try {
-        const s = fs.statSync(targetFilePath);
-        if (s.size === 0) {
-          fs.unlinkSync(targetFilePath);
-        }
-      } catch (e) {}
+    if (targetFilePath) {
+      cleanupTempFiles(targetFilePath);
     }
     throw err;
   } finally {
+    if (overallTimer) {
+      clearTimeout(overallTimer);
+    }
+    if (page) {
+      try {
+        await page.close();
+      } catch (e) {}
+      page = null;
+    }
     if (browser) {
       try {
         await browser.close();
-      } catch (e) {
-        // ignore close error
-      }
+      } catch (e) {}
+      // Terminate lingering process to prevent zombie processes in Linux container
+      try {
+        const proc = browser.process();
+        if (proc && !proc.killed) {
+          proc.kill('SIGKILL');
+        }
+      } catch (e) {}
+      browser = null;
     }
   }
 }
 
 module.exports = {
-  processYouTubeDownload
+  processYouTubeDownload,
+  cleanupTempFiles
 };

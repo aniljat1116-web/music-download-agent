@@ -103,9 +103,10 @@ function emitJobProgress(job, event) {
   job.percent = event.percent != null ? event.percent : job.percent;
   job.message = event.message || job.message;
   job.logs.push({
-    timestamp: new Date().toLocaleTimeString(),
+    timestamp: event.timestamp || new Date().toISOString(),
     phase: event.phase,
     percent: event.percent,
+    elapsedMs: event.elapsedMs,
     message: event.message
   });
 
@@ -137,6 +138,7 @@ async function runJob(jobId) {
 
   activeJobs.add(jobId);
   const startTime = Date.now();
+  console.log(`[${new Date().toISOString()}] [Job ${jobId}] Started processing (Video ID: ${job.videoId})`);
 
   try {
     const result = await processYouTubeDownload(job.url, {
@@ -148,6 +150,9 @@ async function runJob(jobId) {
     job.result = result;
     job.percent = 100;
     job.message = 'Audio successfully downloaded and verified!';
+
+    const elapsedSec = ((Date.now() - startTime) / 1000).toFixed(1);
+    console.log(`[${new Date().toISOString()}] [Job ${jobId} COMPLETED] (+${elapsedSec}s) File: ${result.filename} (${result.fileSizeFormatted})`);
 
     const donePayload = `data: ${JSON.stringify({
       jobId,
@@ -166,12 +171,17 @@ async function runJob(jobId) {
     job.sseClients = [];
 
   } catch (err) {
+    const elapsedSec = ((Date.now() - startTime) / 1000).toFixed(1);
+    console.error(`[${new Date().toISOString()}] [Job ${jobId} ERROR] (+${elapsedSec}s) ${err.message}`);
+
     job.status = 'error';
     job.error = err.message || 'An unexpected error occurred during download';
     job.message = job.error;
     job.logs.push({
-      timestamp: new Date().toLocaleTimeString(),
+      timestamp: new Date().toISOString(),
       phase: 'error',
+      percent: job.percent,
+      elapsedMs: Date.now() - startTime,
       message: job.error
     });
 
@@ -200,12 +210,16 @@ async function runJob(jobId) {
  * Process next job from FIFO queue if workers are available
  */
 function processNextJob() {
-  if (activeJobs.size >= MAX_CONCURRENT_JOBS || jobQueue.length === 0) {
-    return;
+  while (activeJobs.size < MAX_CONCURRENT_JOBS && jobQueue.length > 0) {
+    const nextJobId = jobQueue.shift();
+    if (nextJobId) {
+      try {
+        runJob(nextJobId);
+      } catch (err) {
+        console.error(`[${new Date().toISOString()}] Failed to launch queued job ${nextJobId}:`, err);
+      }
+    }
   }
-
-  const nextJobId = jobQueue.shift();
-  runJob(nextJobId);
 }
 
 /**
